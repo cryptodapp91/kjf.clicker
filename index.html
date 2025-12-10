@@ -1,0 +1,778 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+// Importa gli elementi necessari dall'SDK TON Connect
+// NOTA: Questi oggetti sono disponibili grazie allo script CDN caricato nell'index.html
+const { 
+    TonConnectUIProvider, 
+    TonConnectButton, 
+    useTonConnectUI, 
+    useTonWallet 
+} = window['tonconnect-ui-react']; 
+
+// Icone di esempio da lucide-react.
+const { 
+    Coins, 
+    Zap, 
+    Loader, 
+    Users, 
+    Settings, 
+    ArrowUpCircle, 
+    CheckCircle, 
+    Clock, 
+    XCircle, 
+    Copy, 
+    Rocket, 
+    BatteryCharging, 
+    Wallet 
+} = lucide;
+
+// === CONFIGURAZIONE TON CONNECT REALE E WALLET ===
+// 1. INDIRIZZO DESTINAZIONE (QUESTO DEVE ESSERE IL TUO WALLET)
+// DEVI CAMBIARE QUESTO INDIRIZZO con il tuo indirizzo TON REALE!
+const TON_DESTINATION_WALLET = "EQCD39VS5jcptHL8sPsmhlLgO-S_NtrJRxKDsC9JMJ-J8isI"; // Esempio Fittizio
+
+// 2. TOKEN E COSTANTI 
+const MINING_IMAGE_URL = "uploaded:GzVt1NQWkAArFgW.jfif-f7158de1-3681-42e2-8735-8c2ffa4dd878";
+const TOKEN_SYMBOL = 'KJF'; // Simbolo del tuo token in-game
+const TON_SYMBOL = 'TON'; // Simbolo di The Open Network
+
+// Costi in TON (devi usare BigInt per le transazioni in NanoTON, ma per l'UI usiamo numeri)
+const REFILL_TON_COST = 0.05;
+const AUTO_TAPPER_TON_COST = 5.0;
+const BOOSTER_TON_COST = 1.0; 
+
+const BOOSTER_DURATION_MS = 24 * 60 * 60 * 1000;
+const AUTO_TAPPER_RATE = 50; // Taps per secondo simulati dall'Auto-Tapper
+
+// --- FUNZIONI DI UTILITÀ ---
+
+// Funzione helper per formattare i numeri grandi
+const formatNumber = (num) => {
+    if (num === null || num === undefined) return '0.00';
+    if (num >= 1e9) return (num / 1e9).toFixed(2) + ' B';
+    if (num >= 1e6) return (num / 1e6).toFixed(2) + ' M';
+    if (num >= 1e3) return (num / 1e3).toFixed(2) + ' K';
+    return num.toFixed(2);
+};
+
+// Funzione helper per formattare la durata (HH:MM:SS)
+const formatDuration = (ms) => {
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    
+    const pad = (num) => String(num).padStart(2, '0');
+    return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+};
+
+// Funzione helper per abbreviare l'indirizzo del wallet
+const shortenAddress = (address) => {
+    if (!address) return '';
+    return `${address.substring(0, 5)}...${address.substring(address.length - 4)}`;
+};
+
+// Componente Modal personalizzato (sostituisce alert())
+const CustomModal = ({ message, onClose, title = "Notifica" }) => {
+  if (!message) return null;
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
+      <div className="bg-gray-800 p-6 rounded-xl shadow-2xl max-w-sm w-full border border-gray-700">
+        <div className="flex justify-center mb-4">
+          {title.includes("TON") ? (
+            <Rocket className="text-blue-500" size={40} />
+          ) : (
+            <CheckCircle className="text-green-500" size={40} />
+          )}
+        </div>
+        <h3 className="text-white text-center text-xl font-bold mb-3">{title}</h3>
+        <p className="text-center text-white mb-6 text-lg font-semibold whitespace-pre-line">{message}</p>
+        <button
+          onClick={onClose}
+          className="w-full bg-blue-600 text-white font-bold py-3 rounded-lg shadow-md hover:bg-blue-700 transition-all active:scale-95"
+        >
+          Chiudi
+        </button>
+      </div>
+    </div>
+  );
+};
+
+// --- COMPONENTE PRINCIPALE ---
+const App = () => {
+  // Hook per TON Connect
+  const [tonConnectUI] = useTonConnectUI();
+  const wallet = useTonWallet(); // Ottiene lo stato di connessione del wallet
+
+  // --- Stati del Gioco ---
+  const [isAppReady, setIsAppReady] = useState(false);
+  const [balance, setBalance] = useState(10000.00); 
+  const [tapPower, setTapPower] = useState(1.0);
+  const [miningRate, setMiningRate] = useState(0.1);
+  const [energy, setEnergy] = useState(500);
+  const [maxEnergy, setMaxEnergy] = useState(500);
+  const [activeTab, setActiveTab] = useState('mine');
+  const [tapFeedback, setTapFeedback] = useState([]);
+  const [modalMessage, setModalMessage] = useState(null);
+  const [modalTitle, setModalTitle] = useState("Notifica");
+  
+  // STATI PREMIUM
+  const [isAutoTapperActive, setIsAutoTapperActive] = useState(false);
+  const [boosterMultiplier, setBoosterMultiplier] = useState(1);
+  const [boosterEndTime, setBoosterEndTime] = useState(null); 
+  
+  // Calcola la potenza di tap effettiva (TapPower * BoosterMultiplier)
+  const effectiveTapPower = tapPower * boosterMultiplier;
+
+  // Simulazione del caricamento iniziale
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setIsAppReady(true);
+    }, 500);
+    return () => clearTimeout(timer);
+  }, []);
+
+  // --- LOGICA TON CONNECT E TRANSAZIONI REALI ---
+
+  /**
+   * Invia una transazione TON attraverso l'SDK TonConnect.
+   * @param {number} tonAmount La quantità di TON da inviare (in TON, non NanoTON).
+   * @param {string} featureName Il nome della funzionalità acquistata.
+   * @param {function} onSuccess La callback da eseguire in caso di successo.
+   */
+  const sendTonTransaction = async (tonAmount, featureName, onSuccess) => {
+    if (!wallet) {
+        setModalTitle("Wallet Non Connesso");
+        setModalMessage(`Devi prima connettere il tuo wallet TON per acquistare ${featureName}.`);
+        return;
+    }
+
+    try {
+        setModalTitle("Transazione TON in Corso...");
+        setModalMessage(`Invio richiesta per ${tonAmount} ${TON_SYMBOL}. Attendere approvazione nel wallet.`);
+        
+        // Converte l'importo in NanoTON (1 TON = 1,000,000,000 NanoTON)
+        const amountNano = BigInt(Math.round(tonAmount * 1_000_000_000)).toString();
+
+        const transaction = {
+            validUntil: Math.floor(Date.now() / 1000) + 60, // Scade tra 60 secondi
+            messages: [
+                {
+                    address: TON_DESTINATION_WALLET, // Indirizzo del tuo bot/wallet
+                    amount: amountNano, 
+                    // payload: 'te6ccgEBAQEAAgAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAE=' // Opzionale per dati aggiuntivi
+                }
+            ],
+        };
+
+        // CHIAMATA REALE ALL'SDK
+        const result = await tonConnectUI.sendTransaction(transaction);
+
+        // Se la transazione va a buon fine, procedi con l'attivazione
+        setModalTitle("Transazione TON Riuscita!");
+        setModalMessage(`ACQUISTO RIUSCITO! La transazione di ${tonAmount} ${TON_SYMBOL} è stata confermata. Attivazione immediata di ${featureName}.`);
+        onSuccess();
+        
+    } catch (error) {
+        console.error("Errore Transazione TON:", error);
+        let errorMessage = "Un errore sconosciuto ha causato il fallimento della transazione.";
+        
+        // L'oggetto errore di solito contiene dettagli
+        if (error.message && error.message.includes('Cancelled')) {
+            errorMessage = "Transazione annullata dall'utente.";
+        } else if (error.message) {
+            errorMessage = `Transazione fallita: ${error.message}`;
+        }
+
+        setModalTitle("Transazione Fallita");
+        setModalMessage(errorMessage);
+    }
+  };
+
+
+  // --- LOGICA DI GIOCO ---
+
+  // Hook 1: Mining Passivo & Auto-Tapper
+  useEffect(() => {
+    if (!isAppReady) return;
+    const interval = setInterval(() => {
+      let totalGain = miningRate;
+      if (isAutoTapperActive) {
+          // Aggiunge il guadagno dell'Auto-Tapper
+          totalGain += effectiveTapPower * (AUTO_TAPPER_RATE / 1000); 
+      }
+      setBalance(prev => prev + totalGain);
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [miningRate, isAppReady, isAutoTapperActive, effectiveTapPower]);
+
+
+  // Hook 2: Recupero Energia
+  useEffect(() => {
+    if (!isAppReady) return;
+    const energyRecoveryInterval = setInterval(() => {
+      setEnergy(prev => Math.min(maxEnergy, prev + 2)); 
+    }, 1000);
+
+    return () => clearInterval(energyRecoveryInterval);
+  }, [maxEnergy, isAppReady]);
+
+
+  // Hook 3: Booster Timer
+  useEffect(() => {
+    if (!isAppReady || !boosterEndTime) return;
+
+    const checkBooster = () => {
+        const now = Date.now();
+        if (now >= boosterEndTime) {
+            setBoosterMultiplier(1);
+            setBoosterEndTime(null);
+            setModalTitle("Booster Scaduto");
+            setModalMessage("Il tuo potenziamento 2X è scaduto.");
+        }
+    };
+
+    checkBooster();
+    const timerInterval = setInterval(checkBooster, 1000);
+
+    return () => clearInterval(timerInterval);
+  }, [isAppReady, boosterEndTime]);
+
+
+  // Funzione per il click/tap
+  const handleTap = useCallback((event) => {
+    if (energy <= 0) {
+        setModalTitle("Energia Esaurita");
+        setModalMessage("Energia esaurita! Attendi il recupero o usa una ricarica istantanea.");
+        return;
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+
+    const newFeedback = {
+      id: Date.now(),
+      x: x,
+      y: y,
+      value: `+${formatNumber(effectiveTapPower)}`,
+    };
+
+    setTapFeedback(prev => [...prev, newFeedback]);
+    setBalance(prev => prev + effectiveTapPower);
+    setEnergy(prev => Math.max(0, prev - 1)); 
+
+    setTimeout(() => {
+      setTapFeedback(prev => prev.filter(f => f.id !== newFeedback.id));
+    }, 800);
+  }, [effectiveTapPower, energy]);
+
+
+  // Funzione per acquisti IN-GAME (con KJF)
+  const handleKJFUpgrade = (cost, powerIncrease) => {
+    if (balance >= cost) {
+      setBalance(prev => prev - cost);
+      setTapPower(prev => prev + powerIncrease);
+      setModalTitle("Upgrade Base Riuscito");
+      setModalMessage(`Upgrade completato! Potenza di click aumentata a +${formatNumber(tapPower + powerIncrease)} ${TOKEN_SYMBOL}.`);
+    } else {
+      setModalTitle("Errore Saldo");
+      setModalMessage(`Saldo insufficiente. Ti servono ${formatNumber(cost)} ${TOKEN_SYMBOL}.`);
+    }
+  };
+
+
+  // Gestore Acquisto TON (Chiama sendTonTransaction)
+  const handleTONPurchase = (tonAmount, featureName, activationLogic) => {
+      const onSuccess = () => activationLogic();
+      sendTonTransaction(tonAmount, featureName, onSuccess);
+  };
+
+
+  // 1. Ricarica Energia Istantanea 
+  const handleRefill = () => {
+    if (energy === maxEnergy) {
+        setModalTitle("Energia Piena");
+        setModalMessage("La tua energia è già al massimo. Non serve ricaricare!");
+        return;
+    }
+    const activationLogic = () => setEnergy(maxEnergy);
+    handleTONPurchase(REFILL_TON_COST, 'Ricarica Istantanea', activationLogic);
+  };
+
+
+  // 2. Acquisto Auto-Tapper 
+  const handleAutoTapperPurchase = () => {
+    if (isAutoTapperActive) {
+      setModalTitle("Già Attivo");
+      setModalMessage("L'Auto-Tapper è già sbloccato! Goditi il guadagno passivo.");
+      return;
+    }
+    const activationLogic = () => setIsAutoTapperActive(true);
+    handleTONPurchase(AUTO_TAPPER_TON_COST, 'Auto-Tapper BOT', activationLogic);
+  };
+
+  // 3. Acquisto Booster 24h
+  const handleBoosterPurchase = () => {
+    if (boosterMultiplier > 1) {
+      setModalTitle("Booster Attivo");
+      setModalMessage("Hai già un Booster attivo. Attendi che scada per acquistarne un altro.");
+      return;
+    }
+    const activationLogic = () => {
+        const newEndTime = Date.now() + BOOSTER_DURATION_MS;
+        setBoosterEndTime(newEndTime);
+        setBoosterMultiplier(2);
+    };
+    handleTONPurchase(BOOSTER_TON_COST, 'Booster 2X (24 Ore)', activationLogic);
+  };
+  
+  // Funzione per copiare il testo negli appunti
+  const copyToClipboard = (text) => {
+    // Implementazione standard di copia
+    const tempInput = document.createElement('textarea');
+    tempInput.value = text;
+    document.body.appendChild(tempInput);
+    tempInput.select();
+    document.execCommand('copy');
+    document.body.removeChild(tempInput);
+    setModalMessage('Link copiato negli appunti!');
+  };
+
+
+  // Componente per la barra di navigazione inferiore
+  const Navbar = () => (
+    <div className="fixed bottom-0 left-0 right-0 bg-gray-800 border-t border-gray-700 shadow-2xl z-20">
+      <div className="flex justify-around items-center h-16 max-w-xl mx-auto">
+        {[
+          { id: 'task', label: 'Task', icon: CheckCircle },
+          { id: 'tech', label: 'Tech', icon: ArrowUpCircle }, 
+          { id: 'mine', label: 'Mine', icon: Loader },
+          { id: 'friends', label: 'Amici', icon: Users },
+          { id: 'settings', label: 'Wallet', icon: Settings }, 
+        ].map(({ id, label, icon: Icon }) => (
+          <button
+            key={id}
+            onClick={() => setActiveTab(id)}
+            className={`flex flex-col items-center justify-center p-1 transition-colors ${
+              activeTab === id ? 'text-green-400' : 'text-gray-400 hover:text-green-300'
+            }`}
+          >
+            <Icon size={24} strokeWidth={activeTab === id ? 2.5 : 2} />
+            <span className="text-xs mt-0.5">{label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
+  // Componente Scheda Tech (ex Upgrade)
+  const TechTab = () => {
+    return (
+      <div className="p-4 space-y-6">
+        <h2 className="text-2xl font-bold text-white mb-4 border-b border-gray-700 pb-2">Potenziamenti Base ({TOKEN_SYMBOL})</h2>
+
+        {/* Upgrade Tap Power */}
+        <div className="bg-gray-800 p-4 rounded-xl shadow-lg flex justify-between items-center">
+          <div>
+            <h3 className="text-lg font-semibold text-green-400">Potenza di Click (Liv. 1)</h3>
+            <p className="text-sm text-gray-400">Aumenta il guadagno per ogni tap. Attuale: +{formatNumber(tapPower)} {TOKEN_SYMBOL}</p>
+          </div>
+          <button
+            onClick={() => handleKJFUpgrade(500, 1.0)} 
+            className="bg-blue-600 text-white px-4 py-2 rounded-lg font-bold shadow-md hover:bg-blue-700 transition-all active:scale-95"
+          >
+            Acquista (500 {TOKEN_SYMBOL})
+          </button>
+        </div>
+
+        {/* Upgrade Mining Rate */}
+        <div className="bg-gray-800 p-4 rounded-xl shadow-lg flex justify-between items-center">
+          <div>
+            <h3 className="text-lg font-semibold text-green-400">Mining Passivo (Liv. 1)</h3>
+            <p className="text-sm text-gray-400">Aumenta il guadagno orario/secondo. Attuale: {formatNumber(miningRate)} {TOKEN_SYMBOL}/s</p>
+          </div>
+          <button
+            onClick={() => handleKJFUpgrade(1000, 0.5)} 
+            className="bg-blue-600 text-white px-4 py-2 rounded-lg font-bold shadow-md hover:bg-blue-700 transition-all active:scale-95"
+          >
+            Acquista (1K {TOKEN_SYMBOL})
+          </button>
+        </div>
+        
+        <h2 className="text-2xl font-bold text-white mb-4 border-b border-gray-700 pb-2 pt-4 flex items-center">
+            <Rocket className="mr-2 text-red-500" size={24} />
+            Acquisti Premium (Pagamento in {TON_SYMBOL})
+        </h2>
+
+        {/* Acquisto Auto-Tapper */}
+        <div className="bg-gray-800 p-4 rounded-xl shadow-lg flex justify-between items-center border border-yellow-500/50">
+          <div>
+            <h3 className="text-lg font-semibold text-yellow-400">Auto-Tapper (BOT)</h3>
+            <p className="text-sm text-gray-400">Guadagna automaticamente senza consumare energia. Acquisto una tantum.</p>
+            {isAutoTapperActive && <p className="text-xs text-green-500 mt-1 font-semibold">ATTIVO - {AUTO_TAPPER_RATE} Taps/s Simulati</p>}
+          </div>
+          <button
+            onClick={handleAutoTapperPurchase} 
+            disabled={isAutoTapperActive || !wallet}
+            className={`px-4 py-2 rounded-lg font-bold shadow-md transition-all active:scale-95 ${
+                isAutoTapperActive ? 'bg-green-600 opacity-70 cursor-not-allowed' : 
+                (!wallet ? 'bg-gray-600 opacity-70 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700 text-white')
+            }`}
+          >
+            {isAutoTapperActive ? 'Sbloccato' : `Compra (${AUTO_TAPPER_TON_COST} ${TON_SYMBOL})`}
+          </button>
+        </div>
+
+        {/* Acquisto Booster 24h */}
+        <div className="bg-gray-800 p-4 rounded-xl shadow-lg flex justify-between items-center border border-red-500/50">
+          <div>
+            <h3 className="text-lg font-semibold text-red-400">Booster 2X (24 Ore)</h3>
+            <p className="text-sm text-gray-400">Raddoppia la tua potenza di click. Acquisto singolo.</p>
+            {boosterMultiplier > 1 && <p className="text-xs text-red-500 mt-1 font-semibold">ATTIVO - Tempo rimanente: {formatDuration(boosterEndTime - Date.now())}</p>}
+          </div>
+          <button
+            onClick={handleBoosterPurchase} 
+            disabled={boosterMultiplier > 1 || !wallet}
+            className={`px-4 py-2 rounded-lg font-bold shadow-md transition-all active:scale-95 ${
+                boosterMultiplier > 1 ? 'bg-green-600 opacity-70 cursor-not-allowed' : 
+                (!wallet ? 'bg-gray-600 opacity-70 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700 text-white')
+            }`}
+          >
+            {boosterMultiplier > 1 ? 'Attivo' : `Compra (${BOOSTER_TON_COST} ${TON_SYMBOL})`}
+          </button>
+        </div>
+
+        {/* Ricarica Energia Istantanea */}
+        <div className="bg-gray-800 p-4 rounded-xl shadow-lg flex justify-between items-center border border-yellow-500/50">
+          <div>
+            <h3 className="text-lg font-semibold text-yellow-400">Ricarica Energia</h3>
+            <p className="text-sm text-gray-400">Ricarica istantaneamente l'energia al massimo.</p>
+            {energy === maxEnergy && <p className="text-xs text-green-500 mt-1 font-semibold">ENERGIA PIENA</p>}
+          </div>
+          <button
+            onClick={handleRefill} 
+            disabled={energy === maxEnergy || !wallet}
+            className={`px-4 py-2 rounded-lg font-bold shadow-md transition-all active:scale-95 ${
+                energy === maxEnergy || !wallet ? 'bg-gray-600 opacity-70 cursor-not-allowed' : 'bg-yellow-600 hover:bg-yellow-700 text-white'
+            }`}
+          >
+            {energy === maxEnergy ? 'Piena' : `Compra (${REFILL_TON_COST} ${TON_SYMBOL})`}
+          </button>
+        </div>
+
+
+        <p className="text-center text-gray-500 pt-4">I Potenziamenti Base usano {TOKEN_SYMBOL}. Gli Acquisti Premium richiedono ${TON_SYMBOL}.</p>
+      </div>
+    );
+  };
+
+
+  // Componente Scheda Task
+  const TaskTab = () => (
+    <div className="p-4 space-y-4">
+      <h2 className="text-2xl font-bold text-white mb-4 border-b border-gray-700 pb-2">Sezione Task</h2>
+      
+      {/* Task: Segui su X/Twitter (ATTIVO) */}
+      <div className="bg-gray-800 p-4 rounded-xl shadow-lg flex justify-between items-center">
+        <div>
+          <h3 className="text-lg font-semibold text-green-400">Segui su X/Twitter</h3>
+          <p className="text-sm text-gray-400">Completa il task e ottieni 10.000 {TOKEN_SYMBOL} bonus.</p>
+        </div>
+        <a 
+          href="https://x.com/KJF_Sol" 
+          target="_blank" 
+          rel="noopener noreferrer" 
+          className="bg-green-600 text-white px-4 py-2 rounded-lg font-bold shadow-md hover:bg-green-700 transition-all active:scale-95"
+        >
+          Vai
+        </a>
+      </div>
+      
+      {/* Task: Unisciti al Canale Telegram (COMPLETATO) */}
+      <div className="bg-gray-800 p-4 rounded-xl shadow-lg flex justify-between items-center">
+        <div>
+          <h3 className="text-lg font-semibold text-gray-300">Unisciti al Canale Telegram</h3>
+          <p className="text-sm text-gray-500">Task completato. Bonus riscattato. <a href="https://t.me/KJFSol" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300">Visita il canale</a></p>
+        </div>
+        <CheckCircle className="text-green-500" size={32} />
+      </div>
+
+    </div>
+  );
+
+  // Componente Scheda Amici (Friends)
+  const FriendsTab = () => (
+    <div className="p-4 space-y-4">
+      <h2 className="text-2xl font-bold text-white mb-4 border-b border-gray-700 pb-2">Sezione Amici</h2>
+      <p className="text-gray-400 mb-4">Invita amici per ottenere bonus di mining passivo e ricompense aggiuntive. Tu e il tuo amico ricevete un bonus!</p>
+
+      <div className="bg-gray-800 p-4 rounded-xl shadow-lg">
+        <h3 className="text-xl font-bold text-green-400 mb-2">Il tuo Link di Invito</h3>
+        <div className="flex items-center space-x-2">
+          <input
+            readOnly
+            id="invite-link"
+            value="t.me/your_bot?start=INVITE_CODE_XYZ"
+            className="flex-grow bg-gray-700 p-2 rounded text-sm text-gray-200 truncate"
+          />
+          <button
+            onClick={() => copyToClipboard("t.me/your_bot?start=INVITE_CODE_XYZ")}
+            className="bg-green-600 text-white px-3 py-2 rounded-lg font-bold hover:bg-green-700 transition-all active:scale-95 flex items-center"
+          >
+            <Copy size={18} className="mr-1"/> Copia
+          </button>
+        </div>
+        <p className="text-xs text-gray-500 mt-2">Invita almeno 3 amici per sbloccare la funzione Auto-Tap!</p>
+      </div>
+
+      <h3 className="text-lg font-semibold text-white mt-6">I tuoi Riferimenti (0)</h3>
+      <p className="text-gray-500">Nessun amico invitato finora. Inizia a condividere!</p>
+    </div>
+  );
+  
+  // Componente Scheda Impostazioni/Wallet
+  const SettingsTab = () => (
+    <div className="p-4 space-y-6">
+        <h2 className="text-2xl font-bold text-white mb-4 border-b border-gray-700 pb-2 flex items-center">
+            <Wallet className="mr-2 text-blue-400" size={24} /> Gestione Wallet TON
+        </h2>
+
+        {/* Pulsante di Connessione Reale da TonConnect */}
+        <div className="bg-gray-800 p-6 rounded-xl shadow-xl border border-blue-600/50 space-y-4 flex flex-col items-center">
+             <p className="text-gray-400">Usa il pulsante qui sotto per connettere/disconnettere il tuo wallet.</p>
+             <TonConnectButton className="w-full" />
+             
+             {wallet && (
+                <div className="w-full mt-4">
+                    <p className="text-green-400 font-bold text-lg flex items-center">
+                        <CheckCircle className="mr-2" size={20} /> Connesso a:
+                    </p>
+                    <div className="bg-gray-700 p-3 rounded-lg break-words">
+                        <p className="text-sm text-gray-400">Indirizzo ({wallet.chain}):</p>
+                        <p className="text-white font-mono text-base">{wallet.account.address}</p>
+                    </div>
+                </div>
+             )}
+        </div>
+        
+        <h3 className="text-xl font-bold text-white pt-4 border-t border-gray-700">Info Pagamenti</h3>
+        <div className="bg-gray-800 p-4 rounded-xl">
+            <p className="text-gray-400 text-sm">Indirizzo di Destinazione (tuo wallet):</p>
+            <div className="bg-gray-700 p-2 rounded text-white font-mono text-sm mt-2 break-all flex justify-between items-center">
+                {TON_DESTINATION_WALLET}
+                <button 
+                    onClick={() => copyToClipboard(TON_DESTINATION_WALLET)}
+                    className="ml-2 p-1 rounded bg-gray-600 hover:bg-gray-500 transition-colors"
+                    title="Copia Indirizzo"
+                >
+                    <Copy size={16} className="text-gray-300"/>
+                </button>
+            </div>
+            <p className="text-xs text-red-400 mt-2">ATTENZIONE: CAMBIA questo indirizzo di esempio con il tuo indirizzo TON REALE.</p>
+        </div>
+    </div>
+  );
+
+
+  // Componente Principale per il Mining
+  const MineTab = () => (
+    <div className="flex flex-col items-center justify-start p-4 h-full pt-8">
+
+      {/* Dati Mining e Booster Attivo */}
+      <div className="w-full max-w-sm flex flex-col space-y-2 mb-6">
+        <div className="flex justify-around p-3 bg-gray-800 rounded-xl shadow-inner border border-gray-700">
+            <div className="flex items-center space-x-2 text-green-400">
+                <Zap size={20} />
+                <span className="text-sm font-bold">Tap Power: +{formatNumber(effectiveTapPower)}</span>
+            </div>
+            <div className="flex items-center space-x-2 text-yellow-400">
+                <Clock size={20} />
+                <span className="text-sm">Passivo: +{formatNumber(miningRate)}/s</span>
+            </div>
+        </div>
+        
+        {/* Visualizzazione Booster */}
+        {boosterMultiplier > 1 && (
+            <div className="p-2 bg-red-800/50 rounded-lg text-center font-semibold text-red-300 border border-red-700 shadow-md">
+                BOOSTER 2X ATTIVO: {formatDuration(boosterEndTime - Date.now())}
+            </div>
+        )}
+
+        {/* Visualizzazione Auto-Tapper */}
+        {isAutoTapperActive && (
+            <div className="p-2 bg-yellow-800/50 rounded-lg text-center font-semibold text-yellow-300 border border-yellow-700 shadow-md flex items-center justify-center">
+                <Clock size={16} className="mr-1"/> AUTO-TAPPER ATTIVO
+            </div>
+        )}
+      </div>
+
+      {/* Area Tappabile */}
+      <div
+        className="relative w-full max-w-sm flex flex-col items-center justify-center p-4"
+        onClick={handleTap}
+        onTouchStart={handleTap}
+      >
+        <div
+          className={`relative w-64 h-64 sm:w-80 sm:h-80 rounded-full bg-gray-700 shadow-2xl transition-transform duration-100 ease-out active:scale-[0.98] cursor-pointer
+                      flex items-center justify-center overflow-hidden border-8 ${boosterMultiplier > 1 ? 'border-red-500' : 'border-green-500/50'}`}
+        >
+          {/* Immagine di Kim Jong-un con i binocoli */}
+          <img
+            src={MINING_IMAGE_URL}
+            alt="Mining Target"
+            className="w-full h-full object-cover rounded-full"
+            // Aggiornato il placeholder per riflettere il simbolo KJF
+            onError={(e) => { e.target.onerror = null; e.target.src="https://placehold.co/300x300/10B981/ffffff?text=KJF+TOKEN" }}
+          />
+
+          {/* Animazione Feedback Taps */}
+          {tapFeedback.map(f => (
+            <div
+              key={f.id}
+              style={{ top: f.y, left: f.x }}
+              className="absolute text-2xl font-bold text-yellow-300 pointer-events-none whitespace-nowrap animate-tap-feedback"
+            >
+              {f.value}
+            </div>
+          ))}
+
+        </div>
+        <p className="mt-4 text-gray-400 text-sm">Tocca l'immagine per guadagnare {TOKEN_SYMBOL}!</p>
+      </div>
+
+      {/* Bottone Ricarica Energia */}
+      <button
+        onClick={handleRefill} 
+        disabled={energy === maxEnergy || !wallet}
+        className={`mt-6 w-full max-w-xs flex items-center justify-center px-4 py-3 rounded-xl font-bold transition-all active:scale-95 shadow-lg ${
+            energy === maxEnergy || !wallet
+            ? 'bg-gray-700 text-gray-400 cursor-not-allowed'
+            : 'bg-yellow-600 text-white hover:bg-yellow-700'
+        }`}
+      >
+        <BatteryCharging size={20} className="mr-2"/>
+        Ricarica Istantanea ({REFILL_TON_COST} {TON_SYMBOL})
+      </button>
+
+    </div>
+  );
+
+
+  // Renderizza il contenuto in base al tab attivo
+  const renderContent = () => {
+    switch (activeTab) {
+      case 'task':
+        return <TaskTab />;
+      case 'tech': 
+        return <TechTab />;
+      case 'friends':
+        return <FriendsTab />;
+      case 'settings':
+        return <SettingsTab />; 
+      case 'mine':
+      default:
+        return <MineTab />;
+    }
+  };
+
+  if (!isAppReady) {
+    return (
+      <div className="min-h-screen bg-gray-900 flex items-center justify-center text-white">
+        <Loader className="animate-spin mr-3 text-green-500" size={32} />
+        Caricamento App...
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-900 font-sans flex flex-col items-center pb-16">
+      <CustomModal message={modalMessage} onClose={() => setModalMessage(null)} title={modalTitle} />
+      
+      {/* Intestazione (Header) */}
+      <header className="w-full bg-gray-800 p-4 border-b border-gray-700 shadow-xl max-w-xl fixed top-0 z-10">
+        <div className="flex justify-between items-center">
+          <div className="text-lg font-bold text-gray-300 flex flex-col items-start">
+            <div className="flex items-center">
+                <Coins className="text-green-500 mr-2" size={24} />
+                {TOKEN_SYMBOL} Hunter
+            </div>
+            <span className="text-xs font-medium text-purple-400 bg-purple-900/50 px-2 py-0.5 mt-1 rounded-full border border-purple-800 shadow-inner">
+                Solana Network (su TON/Telegram)
+            </span>
+          </div>
+          
+          {/* Bottone TON Connect nell'Header (gestito da TonConnectButton) */}
+          <div className="flex items-center space-x-2">
+            <div className="hidden sm:block">
+                <TonConnectButton />
+            </div>
+            <div className="sm:hidden">
+                <button
+                    onClick={() => tonConnectUI.connectWallet()}
+                    className="bg-blue-600 text-white text-xs font-bold py-1 px-3 rounded-full flex items-center shadow-md hover:bg-blue-700 transition-all"
+                >
+                    <Wallet size={16} className="mr-1" />
+                    {wallet ? shortenAddress(wallet.account.address) : 'Connect'}
+                </button>
+            </div>
+
+            <div className="flex items-center bg-gray-700 p-2 rounded-xl text-white font-mono shadow-inner">
+                <span className="text-green-400 font-extrabold text-xl mr-2">{formatNumber(balance)}</span>
+                <span className="text-sm text-gray-400">{TOKEN_SYMBOL}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Barra Energia */}
+        <div className="mt-3">
+          <div className="flex justify-between items-center mb-1 text-sm font-medium text-gray-400">
+            <span>Energia Residua</span>
+            <span>{energy} / {maxEnergy}</span>
+          </div>
+          <div className="w-full bg-gray-700 rounded-full h-2.5">
+            <div
+              className="bg-yellow-500 h-2.5 rounded-full transition-all duration-300"
+              style={{ width: `${(energy / maxEnergy) * 100}%` }}
+            ></div>
+          </div>
+        </div>
+      </header>
+
+      {/* Contenuto Principale */}
+      <main className="w-full max-w-xl mt-[120px] mb-16 flex-grow">
+        {renderContent()}
+      </main>
+
+      {/* Barra di Navigazione Inferiore */}
+      <Navbar />
+
+      {/* Stili CSS Personalizzati */}
+      <style>{`
+        /* Stili per l'animazione del feedback del tap */
+        @keyframes tap-feedback-anim {
+          0% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+          100% { transform: translate(-50%, -100px) scale(1.5); opacity: 0; }
+        }
+
+        .animate-tap-feedback {
+          animation: tap-feedback-anim 0.8s ease-out forwards;
+        }
+
+        /* Il pulsante TonConnectButton è un componente React, ma per stilarlo: */
+        .ton-connect-button button {
+            background-color: #3b82f6 !important; /* Blue-500 */
+            color: white !important;
+            font-weight: bold !important;
+            padding: 8px 16px !important;
+            border-radius: 9999px !important; /* rounded-full */
+            transition: all 0.2s !important;
+        }
+        .ton-connect-button button:hover {
+             background-color: #2563eb !important; /* Blue-600 */
+        }
+      `}</style>
+    </div>
+  );
+};
